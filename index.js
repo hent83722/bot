@@ -1,4 +1,4 @@
-
+require('dotenv').config();
 const { runPythonDocker } = require('./dockerpython');
 const fetch = global.fetch;
 let lastPresenceOnline = null;
@@ -9,7 +9,7 @@ const fs = require('fs').promises;
 const fsSync = require('fs');
 const path = require('path');
 const { Tail } = require('tail');
-
+const TOKEN = process.env.DISCORD_BOT_TOKEN;
 
 
 
@@ -286,25 +286,27 @@ async function getOrCreateStatusMessage(embed) {
   const channel = await getStatusChannel();
   if (!channel) return null;
 
-  try {
-    const messages = await channel.messages.fetch({ limit: 100 });
-    const botMessages = messages.filter(msg => msg.author.id === client.user.id);
-    for (const msg of botMessages.values()) {
-      await msg.delete().catch(() => {});
+  if (statusMessageId) {
+    try {
+      const msg = await channel.messages.fetch(statusMessageId);
+      await msg.edit({ embeds: [embed] });
+      return msg;
+    } catch (err) {
+
+      statusMessageId = null;
     }
-  } catch (err) {
-    console.error('Failed to delete old status messages:', err);
   }
 
   try {
     const sent = await channel.send({ embeds: [embed] });
     statusMessageId = sent.id;
     return sent;
-  } catch (error) {
-    console.error('Failed to send status message:', error);
+  } catch (err) {
+    console.error('Failed to send status message:', err);
     return null;
   }
 }
+
 
 
 async function updateStatusMessageOnce() {
@@ -605,6 +607,25 @@ async function monitorLogs() {
 }
 
 
+async function cleanupStatusChannelOnStartup() {
+  const channel = await getStatusChannel();
+  if (!channel) return;
+
+  try {
+    const messages = await channel.messages.fetch({ limit: 100 });
+    const botMessages = messages.filter(
+      msg => msg.author.id === client.user.id
+    );
+
+    for (const msg of botMessages.values()) {
+      await msg.delete().catch(() => {});
+    }
+
+    console.log(`🧹 Deleted ${botMessages.size} old status messages`);
+  } catch (err) {
+    console.error('Failed to clean status channel:', err);
+  }
+}
 
 
 
@@ -649,6 +670,8 @@ client.once('ready', async () => {
   } catch (error) {
     console.error('Failed to fetch status channel on startup:', error);
   }
+await cleanupStatusChannelOnStartup();
+await updateStatusMessageOnce();
 
 
   monitorLogs();
@@ -657,9 +680,6 @@ client.once('ready', async () => {
   setInterval(() => {
     updateStatusMessageOnce().catch((err) => console.error('Status update failed:', err));
   }, STATUS_UPDATE_INTERVAL_MS);
-
- 
-  updateStatusMessageOnce().catch((err) => console.error('Initial status update failed:', err));
 });
 
 
