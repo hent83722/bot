@@ -9,11 +9,12 @@ const fs = require('fs').promises;
 const fsSync = require('fs');
 const path = require('path');
 const { Tail } = require('tail');
-const TOKEN = process.env.DISCORD_BOT_TOKEN;
-
-
-
+const TOKEN = process.env.DISCORD_TOKEN;
+if (!TOKEN) {
+  console.error('❌ DISCORD_BOT_TOKEN is NOT set. Slash commands cannot register.');
+}
 const ACTIVITY_CHANNEL_ID = '1449943733758984192'; 
+const LINKED_ACCOUNTS_PATH = path.join(__dirname, 'linkedAccounts.json');
 const CHAT_CHANNEL_ID = '1449943766357246143'; 
 const STATUS_CHANNEL_ID = '1449948050310299718'; 
 const STATUS_UPDATE_INTERVAL_MS = 10000; 
@@ -35,8 +36,28 @@ const RCON_PORT = parseInt(process.env.RCON_PORT || '25575', 10);
 const RCON_PASSWORD = process.env.RCON_PASSWORD || '';
 
 const PY_PERMS_PATH = './pythonPerms.json';
+
+global.pendingLinks = {};    
+global.linkedAccounts = {}; 
+
+const LINK_CODE_EXPIRY_MS = 5 * 60 * 1000;
+
 const chatQueue = [];
 let chatSending = false;
+
+function loadLinkedAccounts() {
+  try {
+    return JSON.parse(fsSync.readFileSync(LINKED_ACCOUNTS_PATH, 'utf8'));
+  } catch {
+    return {};
+  }
+}
+
+function saveLinkedAccounts() {
+  fsSync.writeFileSync(LINKED_ACCOUNTS_PATH, JSON.stringify(global.linkedAccounts, null, 2));
+}
+global.linkedAccounts = loadLinkedAccounts();
+
 
 async function processChatQueue() {
   if (chatSending || chatQueue.length === 0 || !chatChannel) return;
@@ -354,6 +375,24 @@ async function updateStatusMessageOnce() {
 
 const commands = [
   new SlashCommandBuilder()
+  .setName('link')
+  .setDescription('Link your Discord account to your Minecraft account')
+  .addStringOption(opt =>
+    opt.setName('code')
+      .setDescription('4-digit code from .link in Minecraft')
+      .setRequired(true)
+  ),
+
+new SlashCommandBuilder()
+  .setName('mcinfo')
+  .setDescription('Show linked Minecraft account info')
+  .addUserOption(opt =>
+    opt.setName('user')
+      .setDescription('Discord user (optional)')
+      .setRequired(false)
+  ),
+
+  new SlashCommandBuilder()
   .setName('addpyperms')
   .setDescription('Allow a user to run Python commands')
   .addUserOption(opt =>
@@ -559,11 +598,29 @@ async function monitorLogs() {
         return;
       }
 
+
 const chatMatch = line.match(/^\[.*INFO.*\]: <([^>]+)> (.*)$/);
       if (!chatMatch) return;
 
       const player = chatMatch[1];
       const message = chatMatch[2];
+      
+if (message === '.link') {
+  const code = Math.floor(1000 + Math.random() * 9000).toString();
+  global.pendingLinks[code] = {
+    player,
+    expires: Date.now() + LINK_CODE_EXPIRY_MS,
+  };
+
+  const rcon = await getRconClient();
+  if (rcon) {
+    await rcon.send(`tell ${player} §aYour Discord link code is §e${code}§a. Use §e/link ${code}§a in Discord.`);
+  } else {
+    console.log(`[LINK CODE] Player ${player} got code ${code}`);
+  }
+
+  return;
+}
 
 if (!message.startsWith('.') && chatChannel) {
   chatQueue.push(`**${player}**: ${message}`);
@@ -692,129 +749,252 @@ await updateStatusMessageOnce();
 });
 
 
+
+function getPlayTimesFromLogs(playerName) {
+  const logsDir = path.join(__dirname, '..', 'logs');
+  if (!fsSync.existsSync(logsDir)) return null;
+
+  
+  const files = fsSync.readdirSync(logsDir)
+    .filter(f => f.endsWith('.log'))
+    .map(f => {
+      const filePath = path.join(logsDir, f);
+      const stats = fsSync.statSync(filePath);
+      return { filePath, mtime: stats.mtime };
+    })
+    .sort((a, b) => a.mtime - b.mtime); 
+
+  let firstJoin = null;
+  let lastSeen = null;
+
+  const joinRegex = new RegExp(`\\b${playerName} joined the game\\b`);
+  const leaveRegex = new RegExp(`\\b${playerName} left the game\\b`);
+
+  for (const { filePath, mtime } of files) {
+    const content = fsSync.readFileSync(filePath, 'utf8');
+    const lines = content.split('\n');
+
+    for (const line of lines) {
+      const tsMatch = line.match(/^\[(\d{2}):(\d{2}):(\d{2})]/);
+      if (!tsMatch) continue;
+
+      const [_, hh, mm, ss] = tsMatch;
+
+      const dt = new Date(mtime);
+      dt.setHours(parseInt(hh, 10), parseInt(mm, 10), parseInt(ss, 10));
+
+
+      const dtGMT2 = new Date(dt.getTime() + 2 * 60 * 60 * 1000);
+
+      if (joinRegex.test(line)) {
+        if (!firstJoin || dtGMT2 < firstJoin) firstJoin = dtGMT2;
+        if (!lastSeen || dtGMT2 > lastSeen) lastSeen = dtGMT2;
+      }
+
+      if (leaveRegex.test(line)) {
+        if (!lastSeen || dtGMT2 > lastSeen) lastSeen = dtGMT2;
+      }
+    }
+  }
+
+  if (!firstJoin && !lastSeen) return null;
+
+  return {
+    firstJoin: firstJoin.toLocaleString('en-GB', { timeZone: 'Europe/Berlin' }),
+    lastSeen: lastSeen.toLocaleString('en-GB', { timeZone: 'Europe/Berlin' }),
+  };
+}
+
+
+
 client.on('interactionCreate', async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
-if (interaction.commandName === 'addpyperms') {
-  await interaction.deferReply({ ephemeral: true });
 
-  if (!isAuthorized(interaction)) {
-    return interaction.editReply('❌ You are not allowed to manage Python permissions.');
+  const commandName = interaction.commandName;
+
+  
+  if (commandName === 'link') {
+    await interaction.deferReply({ ephemeral: true });
+
+    const code = interaction.options.getString('code');
+    const entry = global.pendingLinks[code];
+
+    if (!entry) return interaction.editReply('❌ Invalid or expired code.');
+    if (Date.now() > entry.expires) {
+      delete global.pendingLinks[code];
+      return interaction.editReply('❌ This code has expired.');
+    }
+
+
+    for (const uid in global.linkedAccounts) {
+      if (global.linkedAccounts[uid].player === entry.player) {
+        return interaction.editReply(
+          '❌ This Minecraft account is already linked to another Discord account.'
+        );
+      }
+    }
+
+ 
+    global.linkedAccounts[interaction.user.id] = {
+      player: entry.player,
+      linkedAt: new Date().toISOString(),
+    };
+    saveLinkedAccounts();
+    delete global.pendingLinks[code];
+
+    console.log('Linked accounts:', global.linkedAccounts); 
+
+    return interaction.editReply(
+      `✅ Successfully linked to Minecraft account **${entry.player}**`
+    );
   }
 
-  const user = interaction.options.getUser('user');
-  const perms = loadPyPerms();
+  if (commandName === 'mcinfo') {
+    await interaction.deferReply({ ephemeral: true });
 
-  if (perms.includes(user.id)) {
-    return interaction.editReply('⚠️ User already has Python permissions.');
+    const targetUser = interaction.options.getUser('user') || interaction.user;
+    const link = global.linkedAccounts[targetUser.id];
+
+    if (!link) {
+      return interaction.editReply('❌ This user has not linked a Minecraft account.');
+    }
+
+    const playTimes = getPlayTimesFromLogs(link.player);
+
+    let reply = `🧱 **Minecraft Info**\n`;
+    reply += `**Player:** ${link.player}\n`;
+    reply += `**Linked Discord:** <@${targetUser.id}>\n`;
+    reply += `**Linked At:** ${new Date(link.linkedAt).toLocaleString()}\n`;
+
+    if (playTimes) {
+      reply += `\n📜 **Server History**\n`;
+      reply += `**First Joined:** ${playTimes.firstJoin ?? 'Unknown'}\n`;
+      reply += `**Last Seen:** ${playTimes.lastSeen ?? 'Unknown'}\n`;
+    } else {
+      reply += `\n📜 **Server History**\nNo log data found.`;
+    }
+
+    return interaction.editReply(reply);
   }
 
-  perms.push(user.id);
-  savePyPerms(perms);
+  if (commandName === 'addpyperms') {
+    await interaction.deferReply({ ephemeral: true });
 
-  return interaction.editReply(`✅ ${user.tag} can now use \`!python\`.`);
-}
+    if (!isAuthorized(interaction)) {
+      return interaction.editReply('❌ You are not allowed to manage Python permissions.');
+    }
 
-if (interaction.commandName === 'removepyperms') {
-  await interaction.deferReply({ ephemeral: true });
+    const user = interaction.options.getUser('user');
+    const perms = loadPyPerms();
 
-  if (!isAuthorized(interaction)) {
-    return interaction.editReply('❌ You are not allowed to manage Python permissions.');
+    if (perms.includes(user.id)) {
+      return interaction.editReply('⚠️ User already has Python permissions.');
+    }
+
+    perms.push(user.id);
+    savePyPerms(perms);
+
+    return interaction.editReply(`✅ ${user.tag} can now use \`!python\`.`);
   }
 
-  const user = interaction.options.getUser('user');
-  let perms = loadPyPerms();
+  if (commandName === 'removepyperms') {
+    await interaction.deferReply({ ephemeral: true });
 
-  perms = perms.filter(id => id !== user.id);
-  savePyPerms(perms);
+    if (!isAuthorized(interaction)) {
+      return interaction.editReply('❌ You are not allowed to manage Python permissions.');
+    }
 
-  return interaction.editReply(`❌ ${user.tag} can no longer use \`!python\`.`);
-}
+    const user = interaction.options.getUser('user');
+    let perms = loadPyPerms();
 
-  if (interaction.commandName === 'whitelist') {
+    perms = perms.filter(id => id !== user.id);
+    savePyPerms(perms);
+
+    return interaction.editReply(`❌ ${user.tag} can no longer use \`!python\`.`);
+  }
+
+
+  if (commandName === 'whitelist') {
     await interaction.deferReply();
-    
+
     const subcommand = interaction.options.getSubcommand();
     const username = interaction.options.getString('username');
-    
+
     let result;
     if (subcommand === 'add') {
       result = await addToWhitelist(username);
     } else if (subcommand === 'remove') {
       result = await removeFromWhitelist(username);
     }
-    
-    await interaction.editReply(result.message);
-    return;
+
+    return interaction.editReply(result.message);
   }
 
-  if (interaction.commandName === 'stop') {
+
+  if (commandName === 'stop') {
     await interaction.deferReply({ ephemeral: true });
+
     if (!isAuthorized(interaction)) {
-      await interaction.editReply('You do not have permission to run this command.');
-      return;
+      return interaction.editReply('You do not have permission to run this command.');
     }
+
     const result = await stopServer();
-    await interaction.editReply(result.message);
-    return;
-  }
-  if (interaction.commandName === 'ai') {
-  await interaction.deferReply(); 
-
-  const prompt = interaction.options.getString('prompt');
-
-  try {
-    const answer = await askAI(prompt);
-
-
-    const trimmed =
-      answer.length > 2000
-        ? answer.slice(0, 1997) + '...'
-        : answer;
-
-    await interaction.editReply(trimmed);
-  } catch (err) {
-    console.error(err);
-    await interaction.editReply('❌ AI failed to respond.');
+    return interaction.editReply(result.message);
   }
 
-  return;
-}
 
-
-  if (interaction.commandName === 'start') {
+  if (commandName === 'start') {
     await interaction.deferReply({ ephemeral: true });
+
     if (!isAuthorized(interaction)) {
-      await interaction.editReply('You do not have permission to run this command.');
-      return;
+      return interaction.editReply('You do not have permission to run this command.');
     }
+
     const result = await startServer();
-    await interaction.editReply(result.message);
-    return;
+    return interaction.editReply(result.message);
   }
 
-  if (interaction.commandName === 'status') {
+
+  if (commandName === 'status') {
     await interaction.deferReply({ ephemeral: true });
 
     try {
       const { status, embed, msg } = await updateStatusMessageOnce();
       if (msg) {
-        await interaction.editReply('Updated status message.');
+        return interaction.editReply('Updated status message.');
       } else {
-        await interaction.editReply({ content: 'Could not reach status channel; showing here.', embeds: [embed] });
+        return interaction.editReply({ content: 'Could not reach status channel; showing here.', embeds: [embed] });
       }
     } catch (error) {
       console.error('Failed to send status embed:', error);
       try {
         const status = await getServerStatus();
         const embed = buildStatusEmbed(status);
-        await interaction.editReply({ content: 'Could not post in the status channel (check bot permissions). Showing here instead.', embeds: [embed] });
+        return interaction.editReply({ content: 'Could not post in the status channel. Showing here instead.', embeds: [embed] });
       } catch (err2) {
-        await interaction.editReply('Failed to fetch status.');
+        return interaction.editReply('Failed to fetch status.');
       }
     }
-    return;
+  }
+
+
+  if (commandName === 'ai') {
+    await interaction.deferReply();
+
+    const prompt = interaction.options.getString('prompt');
+
+    try {
+      const answer = await askAI(prompt);
+      const trimmed = answer.length > 2000 ? answer.slice(0, 1997) + '...' : answer;
+
+      return interaction.editReply(trimmed);
+    } catch (err) {
+      console.error(err);
+      return interaction.editReply('❌ AI failed to respond.');
+    }
   }
 });
+
 
 client.on('messageCreate', async (message) => {
   if (message.author.bot || message.webhookId) return;
