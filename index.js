@@ -35,6 +35,25 @@ const RCON_PORT = parseInt(process.env.RCON_PORT || '25575', 10);
 const RCON_PASSWORD = process.env.RCON_PASSWORD || '';
 
 const PY_PERMS_PATH = './pythonPerms.json';
+const chatQueue = [];
+let chatSending = false;
+
+async function processChatQueue() {
+  if (chatSending || chatQueue.length === 0 || !chatChannel) return;
+
+  chatSending = true;
+  const msg = chatQueue.shift();
+
+  try {
+    await chatChannel.send(msg);
+  } catch (err) {
+    console.error('Failed to send chat message:', err);
+  }
+
+  chatSending = false;
+  processChatQueue();
+}
+
 
 function loadPyPerms() {
   try {
@@ -521,20 +540,11 @@ async function monitorLogs() {
   const tail = new Tail(LOG_PATH, {
     fromBeginning: false,
     follow: true,
-    useWatchFile: true
+    useWatchFile: false
   });
 
   tail.on('line', async (line) => {
-    try {
-  
-      if (!activityChannel) {
-        try { activityChannel = await client.channels.fetch(ACTIVITY_CHANNEL_ID); } catch {}
-      }
-      if (!chatChannel) {
-        try { chatChannel = await client.channels.fetch(CHAT_CHANNEL_ID); } catch {}
-      }
-
-   
+    try { 
       const joinMatch = line.match(/\[Server thread\/INFO\]: (.+?) joined the game/);
       if (joinMatch) {
         const player = joinMatch[1];
@@ -549,52 +559,51 @@ async function monitorLogs() {
         return;
       }
 
-      const chatMatch = line.match(/\[.+?\/INFO\]: <(.+?)> (.+)/);
+const chatMatch = line.match(/^\[.*INFO.*\]: <([^>]+)> (.*)$/);
       if (!chatMatch) return;
 
       const player = chatMatch[1];
       const message = chatMatch[2];
 
-      if (!message.startsWith('.') && chatChannel) {
-        await chatChannel.send(`**${player}**: ${message}`);
+if (!message.startsWith('.') && chatChannel) {
+  chatQueue.push(`**${player}**: ${message}`);
+  processChatQueue();
+}
+
+
+if (message.startsWith('.ai ')) {
+  (async () => {
+    const now = Date.now();
+    if (lastAiUsage[player] && now - lastAiUsage[player] < AI_COOLDOWN_MS) {
+      const rcon = await getRconClient();
+      if (rcon) await rcon.send(`tell ${player} Please wait before using .ai again.`);
+      return;
+    }
+    lastAiUsage[player] = now;
+
+    const prompt = message.slice(4).trim();
+    if (!prompt) return;
+
+    let rcon = await getRconClient();
+    if (!rcon) return;
+
+    try {
+      const answer = await askAI(prompt);
+
+      const MAX_LEN = 240;
+      for (let i = 0; i < answer.length; i += MAX_LEN) {
+        await rcon.send(`say [${player}] ${answer.slice(i, i + MAX_LEN)}`);
       }
+    } catch (err) {
+      console.error('AI command error:', err);
+      rcon = await getRconClient();
+      if (rcon) await rcon.send(`say [Server AI] AI service is unavailable.`);
+    }
+  })();
 
-      if (message.startsWith('.ai ')) {
-        const now = Date.now();
-        if (lastAiUsage[player] && now - lastAiUsage[player] < AI_COOLDOWN_MS) {
-          const rcon = await getRconClient();
-          if (rcon) await rcon.send(`tell ${player} Please wait before using .ai again.`);
-          return;
-        }
-        lastAiUsage[player] = now;
+  return;
+}
 
-        const prompt = message.slice(4).trim();
-        if (!prompt) return;
-
-        let rcon = await getRconClient();
-        if (!rcon) return;
-
-        try {
-
-          const answer = await askAI(prompt);
-
-
-          const chunks = [];
-          const MAX_LEN = 240; 
-          for (let i = 0; i < answer.length; i += MAX_LEN) {
-            chunks.push(answer.slice(i, i + MAX_LEN));
-          }
-
-          for (const chunk of chunks) {
-            await rcon.send(`say [${player}] ${chunk}`);
-          }
-
-        } catch (err) {
-          console.error('AI command error:', err);
-          rcon = await getRconClient();
-          if (rcon) await rcon.send(`say [Server AI] AI service is unavailable.`);
-        }
-      }
 
     } catch (err) {
       console.error('Error processing log line:', err);
