@@ -10,14 +10,12 @@ const fsSync = require('fs');
 const path = require('path');
 const { Tail } = require('tail');
 const TOKEN = process.env.DISCORD_TOKEN;
-if (!TOKEN) {
-  console.error('❌ DISCORD_BOT_TOKEN is NOT set. Slash commands cannot register.');
-}
+const COORDS_PATH = path.join(__dirname, 'coords.json');
 const ACTIVITY_CHANNEL_ID = '1449943733758984192'; 
 const LINKED_ACCOUNTS_PATH = path.join(__dirname, 'linkedAccounts.json');
 const CHAT_CHANNEL_ID = '1449943766357246143'; 
 const STATUS_CHANNEL_ID = '1449948050310299718'; 
-const STATUS_UPDATE_INTERVAL_MS = 10000; 
+const STATUS_UPDATE_INTERVAL_MS = 2000; 
 const STATUS_THUMBNAIL_URL = 'https://media.discordapp.net/attachments/1400886724044783737/1435622515480203274/tuxx.png?ex=69400da8&is=693ebc28&hm=7a9f101dd181fbaf005f8ff2e72c492e5af2a58f1b4bade713774f3c425b0bfc&=&format=webp&quality=lossless';
 const WHITELIST_PATH = path.join(__dirname, '..', 'whitelist.json');
 const LOG_PATH = path.join(__dirname, '..', 'logs', 'latest.log');
@@ -44,6 +42,18 @@ const LINK_CODE_EXPIRY_MS = 5 * 60 * 1000;
 
 const chatQueue = [];
 let chatSending = false;
+
+function loadCoords() {
+  try {
+    return JSON.parse(fsSync.readFileSync(COORDS_PATH, 'utf8'));
+  } catch {
+    return {};
+  }
+}
+
+function saveCoords(data) {
+  fsSync.writeFileSync(COORDS_PATH, JSON.stringify(data, null, 2));
+}
 
 function loadLinkedAccounts() {
   try {
@@ -374,6 +384,51 @@ async function updateStatusMessageOnce() {
 }
 
 const commands = [
+new SlashCommandBuilder()
+  .setName('coords')
+  .setDescription('Save and view Minecraft coordinates')
+  .addSubcommand(sub =>
+    sub
+      .setName('add')
+      .setDescription('Save coordinates to your account')
+      .addStringOption(o =>
+        o
+          .setName('title')
+          .setDescription('Name for this location')
+          .setRequired(true)
+      )
+      .addIntegerOption(o =>
+        o
+          .setName('x')
+          .setDescription('X coordinate')
+          .setRequired(true)
+      )
+      .addIntegerOption(o =>
+        o
+          .setName('y')
+          .setDescription('Y coordinate')
+          .setRequired(true)
+      )
+      .addIntegerOption(o =>
+        o
+          .setName('z')
+          .setDescription('Z coordinate')
+          .setRequired(true)
+      )
+      .addStringOption(o =>
+        o
+          .setName('world')
+          .setDescription('World (overworld, nether, end)')
+          .setRequired(false)
+      )
+  )
+  .addSubcommand(sub =>
+    sub
+      .setName('list')
+      .setDescription('List your saved coordinates')
+  ),
+
+
   new SlashCommandBuilder()
   .setName('link')
   .setDescription('Link your Discord account to your Minecraft account')
@@ -583,89 +638,109 @@ async function monitorLogs() {
   });
 
   tail.on('line', async (line) => {
-    try { 
-      const joinMatch = line.match(/\[Server thread\/INFO\]: (.+?) joined the game/);
-      if (joinMatch) {
-        const player = joinMatch[1];
-        if (activityChannel) await activityChannel.send(`**${player}** joined the server`);
-        return;
-      }
+  try {
 
-      const leaveMatch = line.match(/\[Server thread\/INFO\]: (.+?) left the game/);
-      if (leaveMatch) {
-        const player = leaveMatch[1];
-        if (activityChannel) await activityChannel.send(`**${player}** left the server`);
-        return;
-      }
+    const joinMatch = line.match(/\[Server thread\/INFO\]: (.+?) joined the game/);
+    if (joinMatch) {
+      const player = joinMatch[1];
+      if (activityChannel) await activityChannel.send(`**${player}** joined the server`);
+      return;
+    }
+
+    const leaveMatch = line.match(/\[Server thread\/INFO\]: (.+?) left the game/);
+    if (leaveMatch) {
+      const player = leaveMatch[1];
+      if (activityChannel) await activityChannel.send(`**${player}** left the server`);
+      return;
+    }
+
+const infoMatch = line.match(/\[Server thread\/INFO\]: (.+)$/);
+if (infoMatch) {
+  const text = infoMatch[1];
+
+  if (/^<[^>]+> /.test(text)) return;
+
+  if (
+    text.endsWith('joined the game') ||
+    text.endsWith('left the game') ||
+    text.includes('lost connection') ||
+    text.includes('Disconnected')
+  ) return;
 
 
-const chatMatch = line.match(/^\[.*INFO.*\]: <([^>]+)> (.*)$/);
-      if (!chatMatch) return;
+  if (
+    text.includes('issued server command') ||
+    text.includes('[Rcon]') ||
+    text.includes('[STDOUT]') ||
+    text.includes('Starting minecraft server') ||
+    text.includes('Stopping server') ||
+    text.includes('Disabling') ||
+    text.includes('Enabling')
+  ) return;
 
-      const player = chatMatch[1];
-      const message = chatMatch[2];
-      
-if (message === '.link') {
-  const code = Math.floor(1000 + Math.random() * 9000).toString();
-  global.pendingLinks[code] = {
-    player,
-    expires: Date.now() + LINK_CODE_EXPIRY_MS,
-  };
+  if (text.includes('Villager[') || text.includes('Zombie[') || text.includes('Entity[')) return;
 
-  const rcon = await getRconClient();
-  if (rcon) {
-    await rcon.send(`tell ${player} §aYour Discord link code is §e${code}§a. Use §e/link ${code}§a in Discord.`);
-  } else {
-    console.log(`[LINK CODE] Player ${player} got code ${code}`);
+
+  const playerDeathRegex =
+    /^([A-Za-z0-9_]{3,16}) (was|fell|burned|drowned|blew up|hit the ground|experienced|starved|froze|suffocated|withered|walked into|tried to swim|was shot|was killed)/;
+
+  if (!playerDeathRegex.test(text)) return;
+
+  if (chatChannel) {
+    chatQueue.push(`☠️ **${text}**`);
+    processChatQueue();
   }
 
   return;
 }
 
-if (!message.startsWith('.') && chatChannel) {
-  chatQueue.push(`**${player}**: ${message}`);
-  processChatQueue();
-}
 
+    const chatMatch = line.match(/^\[.*INFO.*\]: <([^>]+)> (.*)$/);
+    if (!chatMatch) return;
 
-if (message.startsWith('.ai ')) {
-  (async () => {
-    const now = Date.now();
-    if (lastAiUsage[player] && now - lastAiUsage[player] < AI_COOLDOWN_MS) {
-      const rcon = await getRconClient();
-      if (rcon) await rcon.send(`tell ${player} Please wait before using .ai again.`);
-      return;
-    }
-    lastAiUsage[player] = now;
+    const player = chatMatch[1];
+    const message = chatMatch[2].trim();
 
-    const prompt = message.slice(4).trim();
-    if (!prompt) return;
+    if (message === '.coords') {
+  const linkedEntry = Object.entries(global.linkedAccounts)
+    .find(([, v]) => v.player === player);
 
-    let rcon = await getRconClient();
-    if (!rcon) return;
+  const rcon = await getRconClient();
+  if (!rcon) return;
 
-    try {
-      const answer = await askAI(prompt);
+  if (!linkedEntry) {
+    await rcon.send(`tell ${player} §cYour account is not linked.`);
+    return;
+  }
 
-      const MAX_LEN = 240;
-      for (let i = 0; i < answer.length; i += MAX_LEN) {
-        await rcon.send(`say [${player}] ${answer.slice(i, i + MAX_LEN)}`);
-      }
-    } catch (err) {
-      console.error('AI command error:', err);
-      rcon = await getRconClient();
-      if (rcon) await rcon.send(`say [Server AI] AI service is unavailable.`);
-    }
-  })();
+  const discordId = linkedEntry[0];
+  const allCoords = loadCoords();
+  const coords = allCoords[discordId] || [];
 
+  if (!coords.length) {
+    await rcon.send(`tell ${player} §7No coordinates saved.`);
+    return;
+  }
+
+  await rcon.send(`tell ${player} §6Saved coordinates:`);
+
+  for (const c of coords) {
+    await rcon.send(
+      `tell ${player} §a${c.title}§7: §f${c.x} ${c.y} ${c.z} §8(${c.world})`
+    );
+  }
   return;
 }
 
-
-    } catch (err) {
-      console.error('Error processing log line:', err);
+    if (!message.startsWith('.') && chatChannel) {
+      chatQueue.push(`**${player}**: ${message}`);
+      processChatQueue();
     }
-  });
+
+  } catch (err) {
+    console.error('Error processing log line:', err);
+  }
+});
 
   tail.on('error', (err) => console.error('Error watching log file:', err));
 
@@ -808,9 +883,51 @@ function getPlayTimesFromLogs(playerName) {
 
 
 client.on('interactionCreate', async (interaction) => {
-  if (!interaction.isChatInputCommand()) return;
 
   const commandName = interaction.commandName;
+  if (commandName === 'coords') {
+    
+  await interaction.deferReply({ ephemeral: true });
+
+  const sub = interaction.options.getSubcommand();
+  const userId = interaction.user.id;
+  const coords = loadCoords();
+
+  if (sub === 'add') {
+    const title = interaction.options.getString('title');
+    const x = interaction.options.getInteger('x');
+    const y = interaction.options.getInteger('y');
+    const z = interaction.options.getInteger('z');
+    const world = interaction.options.getString('world') || 'overworld';
+
+    coords[userId] ??= [];
+    coords[userId].push({
+      title,
+      world,
+      x, y, z,
+      createdAt: new Date().toISOString(),
+    });
+
+    saveCoords(coords);
+
+    return interaction.editReply(
+      `📍 Saved **${title}** at \`${x} ${y} ${z}\` (${world})`
+    );
+  }
+
+  if (sub === 'list') {
+    const list = coords[userId] || [];
+    if (!list.length) {
+      return interaction.editReply('❌ No coordinates saved.');
+    }
+
+    const text = list
+      .map(c => `• **${c.title}** → \`${c.x} ${c.y} ${c.z}\` (${c.world})`)
+      .join('\n');
+
+    return interaction.editReply(text);
+  }
+}
 
   
   if (commandName === 'link') {
