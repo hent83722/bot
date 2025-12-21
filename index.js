@@ -14,7 +14,7 @@ const COORDS_PATH = path.join(__dirname, 'coords.json');
 const ACTIVITY_CHANNEL_ID = '1449943733758984192'; 
 const LINKED_ACCOUNTS_PATH = path.join(__dirname, 'linkedAccounts.json');
 const CHAT_CHANNEL_ID = '1449943766357246143'; 
-const STATUS_CHANNEL_ID = '1449948050310299718'; 
+const STATUS_CHANNEL_ID = '1451614087527268372'; 
 const STATUS_UPDATE_INTERVAL_MS = 2000; 
 const STATUS_THUMBNAIL_URL = 'https://media.discordapp.net/attachments/1400886724044783737/1435622515480203274/tuxx.png?ex=69400da8&is=693ebc28&hm=7a9f101dd181fbaf005f8ff2e72c492e5af2a58f1b4bade713774f3c425b0bfc&=&format=webp&quality=lossless';
 const WHITELIST_PATH = path.join(__dirname, '..', 'whitelist.json');
@@ -37,12 +37,11 @@ const PY_PERMS_PATH = './pythonPerms.json';
 
 global.pendingLinks = {};    
 global.linkedAccounts = {}; 
-
+let statusInterval = null;
 const LINK_CODE_EXPIRY_MS = 5 * 60 * 1000;
 
 const chatQueue = [];
 let chatSending = false;
-
 function loadCoords() {
   try {
     return JSON.parse(fsSync.readFileSync(COORDS_PATH, 'utf8'));
@@ -351,10 +350,24 @@ async function getOrCreateStatusMessage(embed) {
     const sent = await channel.send({ embeds: [embed] });
     statusMessageId = sent.id;
     return sent;
-  } catch (err) {
-    console.error('Failed to send status message:', err);
+} catch (err) {
+  if (err.code === 50013) {
+    console.error(
+      'Missing permissions for status channel. Disabling status updates.'
+    );
+
+    if (statusInterval) {
+      clearInterval(statusInterval);
+      statusInterval = null;
+    }
+
     return null;
   }
+
+  console.error('Failed to send status message:', err);
+  return null;
+}
+
 }
 
 
@@ -818,9 +831,10 @@ await updateStatusMessageOnce();
   monitorLogs();
 
 
-  setInterval(() => {
-    updateStatusMessageOnce().catch((err) => console.error('Status update failed:', err));
-  }, STATUS_UPDATE_INTERVAL_MS);
+statusInterval = setInterval(() => {
+  updateStatusMessageOnce().catch(() => {});
+}, STATUS_UPDATE_INTERVAL_MS);
+
 });
 
 
