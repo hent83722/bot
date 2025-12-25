@@ -14,7 +14,7 @@ const COORDS_PATH = path.join(__dirname, 'coords.json');
 const ACTIVITY_CHANNEL_ID = '1449943733758984192'; 
 const LINKED_ACCOUNTS_PATH = path.join(__dirname, 'linkedAccounts.json');
 const CHAT_CHANNEL_ID = '1449943766357246143'; 
-const STATUS_CHANNEL_ID = '1451614087527268372'; 
+const STATUS_CHANNEL_ID = '1452858138024870039'; 
 const STATUS_UPDATE_INTERVAL_MS = 2000; 
 const STATUS_THUMBNAIL_URL = 'https://media.discordapp.net/attachments/1400886724044783737/1435622515480203274/tuxx.png?ex=69400da8&is=693ebc28&hm=7a9f101dd181fbaf005f8ff2e72c492e5af2a58f1b4bade713774f3c425b0bfc&=&format=webp&quality=lossless';
 const WHITELIST_PATH = path.join(__dirname, '..', 'whitelist.json');
